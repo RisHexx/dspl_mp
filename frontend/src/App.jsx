@@ -4,6 +4,8 @@ import "./App.css";
 const API_URL = "http://localhost:8000";
 const CONFIDENCE_THRESHOLD = 0.82;
 const CAPTURE_INTERVAL_MS = 300;
+// A sign must be out of view this long before it's announced again
+const SIGN_GONE_MS = 5000;
 
 /* ── Box colours by sign family ──────────────────────────────────────── */
 const DANGER = new Set([11, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]);
@@ -17,6 +19,27 @@ function boxColor(classId) {
   if (MANDATORY.has(classId)) return "#3b82f6"; // blue
   if (classId === 12) return "#eab308"; // priority road – yellow
   return "#a3a3a3"; // "end of …" signs – grey
+}
+
+function signCategory(classId) {
+  if (PROHIBITORY.has(classId)) return "Prohibitory";
+  if (DANGER.has(classId)) return "Warning";
+  if (MANDATORY.has(classId)) return "Mandatory";
+  if (classId === 12 || classId === 13) return "Priority";
+  return "End of restriction";
+}
+
+/** Cut a square thumbnail of a detected sign out of the captured frame. */
+function cropThumb(source, box, size = 128) {
+  const [x1, y1, x2, y2] = box;
+  const side = Math.max(x2 - x1, y2 - y1) * 1.15;
+  const sx = Math.max(0, Math.min(source.width - side, (x1 + x2) / 2 - side / 2));
+  const sy = Math.max(0, Math.min(source.height - side, (y1 + y2) / 2 - side / 2));
+  const c = document.createElement("canvas");
+  c.width = size;
+  c.height = size;
+  c.getContext("2d").drawImage(source, sx, sy, side, side, 0, 0, size, size);
+  return c.toDataURL("image/jpeg", 0.85);
 }
 
 /* ── Context-aware speech messages for each GTSRB class ──────────────── */
@@ -86,20 +109,14 @@ function App() {
   // label from flickering on a single bad frame.
   const previousClassesRef = useRef(new Set());
 
-  /* ── TTS cooldown refs ─────────────────────────────────────────────── */
-  const lastSpokenSignRef = useRef(null);
-  const lastSpokenTimeRef = useRef(0);
+  /* ── Voice alerts ──────────────────────────────────────────────────── */
+  // class_id → last time that sign was confirmed in a frame. A sign is only
+  // announced when it *appears*: while it stays in view it is not repeated,
+  // and it must be out of view for SIGN_GONE_MS before it's announced again
+  // (so a single missed frame doesn't trigger a repeat).
+  const lastSeenRef = useRef(new Map());
 
   const speakAlert = useCallback((classId, signName) => {
-    const now = Date.now();
-    // Don't repeat the same sign within 8 seconds
-    if (
-      lastSpokenSignRef.current === classId &&
-      now - lastSpokenTimeRef.current < 8000
-    ) {
-      return;
-    }
-
     // Cancel any ongoing speech
     window.speechSynthesis.cancel();
 
@@ -109,9 +126,6 @@ function App() {
     utterance.pitch = 1.0;
     utterance.volume = 1.0;
     window.speechSynthesis.speak(utterance);
-
-    lastSpokenSignRef.current = classId;
-    lastSpokenTimeRef.current = now;
   }, []);
 
   /* ── Bounding-box overlay ────────────────────────────────────────────── */
@@ -270,16 +284,23 @@ function App() {
 
           // One entry per class (highest confidence wins)
           const seen = new Set();
-          const confirmed = confident.filter((d) => {
-            if (!confirmedIds.has(d.class_id) || seen.has(d.class_id)) return false;
-            seen.add(d.class_id);
-            return true;
-          });
+          const confirmed = confident
+            .filter((d) => {
+              if (!confirmedIds.has(d.class_id) || seen.has(d.class_id)) return false;
+              seen.add(d.class_id);
+              return true;
+            })
+            .map((d) => ({ ...d, thumb: cropThumb(canvas, d.box) }));
           setResults(confirmed);
-          if (confirmed.length > 0) {
-            // detections are sorted by confidence – announce the strongest
-            speakAlert(confirmed[0].class_id, confirmed[0].sign_name);
-          }
+          // Announce only signs that just came into view (strongest first –
+          // detections are sorted by confidence)
+          const nowMs = Date.now();
+          const lastSeen = lastSeenRef.current;
+          const appeared = confirmed.find(
+            (d) => nowMs - (lastSeen.get(d.class_id) ?? 0) > SIGN_GONE_MS
+          );
+          confirmed.forEach((d) => lastSeen.set(d.class_id, nowMs));
+          if (appeared) speakAlert(appeared.class_id, appeared.sign_name);
         } catch (err) {
           console.error(err);
           setError(
@@ -349,21 +370,22 @@ function App() {
             <circle cx="12" cy="12" r="3" />
           </svg>
         </div>
-        <h1>Traffic Sign Detector</h1>
-        {/* <div className="header-meta">
+        <div className="header-title">
+          <h1>Traffic Sign Detector</h1>
+          <p>Real-time recognition of 43 traffic sign classes</p>
+        </div>
+        <div className="header-meta">
           <span className="status-badge">
             <span className={`status-dot ${cameraOn ? "active" : ""}`}></span>
-            {cameraOn ? "System Active" : "System Standby"}
+            {cameraOn ? "Active" : "Standby"}
           </span>
-          <span className="meta-divider">•</span>
-          <span>GTSRB Model</span>
-    </div> */}
-      </header >
+        </div>
+      </header>
 
       {/* Main content */}
-      < main className="main" >
+      <main className="main">
         {/* Camera panel */}
-        < section className="camera-panel" id="camera-panel" >
+        <section className="camera-panel" id="camera-panel">
           <div className="panel-header">
             {cameraOn && <span className="dot" />}
             <span>{cameraOn ? "Live Camera Feed" : "Camera"}</span>
@@ -386,7 +408,13 @@ function App() {
 
             {!cameraOn && (
               <div className="camera-placeholder">
-                <div className="icon">📷</div>
+                <div className="icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M23 7l-7 5 7 5V7z" />
+                    <rect x="1" y="5" width="15" height="14" rx="2" />
+                  </svg>
+                </div>
+                <p className="placeholder-title">Camera is off</p>
                 <p>Start the camera to begin detecting traffic signs</p>
               </div>
             )}
@@ -399,7 +427,7 @@ function App() {
                 onClick={startCamera}
                 id="start-camera-btn"
               >
-                📷 Start Camera
+                Start Camera
               </button>
             ) : (
               <button
@@ -407,14 +435,14 @@ function App() {
                 onClick={stopCamera}
                 id="stop-camera-btn"
               >
-                ⏹ Stop Camera
+                Stop Camera
               </button>
             )}
           </div>
-        </section >
+        </section>
 
         {/* Result panel */}
-        < aside className="result-panel" id="result-panel" >
+        <aside className="result-panel" id="result-panel">
           <div className="panel-header">
             <span>Detection Result</span>
           </div>
@@ -431,26 +459,35 @@ function App() {
             {/* Error state */}
             {error && !loading && (
               <div className="error-display">
-                <div className="icon">⚠️</div>
+                <p className="error-title">Something went wrong</p>
                 <p>{error}</p>
               </div>
             )}
 
-            {/* Results – one card per confirmed sign */}
+            {/* Results – main sign, then any others in view */}
             {results.length > 0 && !loading && (
               <div className="detections-list">
-                <div className="detections-meta">
-                  {results.length} sign{results.length > 1 ? "s" : ""} detected
-                  {latency > 0 && <> · {latency} ms</>}
-                  {mode === "fallback" && <> · no detector loaded</>}
-                </div>
-                {results.map((result) => (
+                {results.map((result, i) => (
                   <div
-                    className="detected-sign"
+                    className={`detected-sign ${i === 0 ? "primary" : "secondary"}`}
                     key={result.class_id}
-                    style={{ borderLeft: `4px solid ${boxColor(result.class_id)}` }}
                   >
-                    <div className="sign-name">{result.sign_name}</div>
+                    <div className="sign-row">
+                      <img className="sign-thumb" src={result.thumb} alt={result.sign_name} />
+                      <div className="sign-text">
+                        <span
+                          className="sign-category"
+                          style={{ color: boxColor(result.class_id) }}
+                        >
+                          {signCategory(result.class_id)}
+                        </span>
+                        <div className="sign-name">{result.sign_name}</div>
+                      </div>
+                    </div>
+
+                    {i === 0 && SPEECH_MESSAGES[result.class_id] && (
+                      <p className="sign-advice">{SPEECH_MESSAGES[result.class_id]}</p>
+                    )}
 
                     <div className="confidence-section">
                       <div className="confidence-label">
@@ -468,23 +505,38 @@ function App() {
                     </div>
                   </div>
                 ))}
+
+                <div className="detections-meta">
+                  {results.length} sign{results.length > 1 ? "s" : ""} detected
+                  {latency > 0 && <> · {latency} ms</>}
+                  {mode === "fallback" && <> · no detector loaded</>}
+                </div>
               </div>
             )}
 
             {/* Empty state */}
             {results.length === 0 && !loading && !error && (
               <div className="result-empty">
-                <div className="icon">🎯</div>
+                <div className="icon">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
+                    <path d="M12 3l9.5 16.5h-19z" />
+                    <path d="M12 10v4" strokeLinecap="round" />
+                    <circle cx="12" cy="16.8" r="0.5" fill="currentColor" />
+                  </svg>
+                </div>
+                <p className="placeholder-title">
+                  {cameraOn ? "Looking for signs…" : "No sign detected yet"}
+                </p>
                 <p>
-                  Start the camera and point it at a traffic sign. It will
-                  <strong> automatically detect</strong> the sign.
+                  Point the camera at a traffic sign and it will be detected
+                  automatically.
                 </p>
               </div>
             )}
           </div>
-        </aside >
-      </main >
-    </div >
+        </aside>
+      </main>
+    </div>
   );
 }
 
