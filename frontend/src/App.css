@@ -149,6 +149,28 @@
   display: none;
 }
 
+/* Bounding-box layer: same size + object-fit as the video so boxes align */
+.camera-feed canvas.overlay-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  pointer-events: none;
+}
+
+.detections-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+}
+
+.detections-meta {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
 .camera-placeholder {
   text-align: center;
   padding: 40px 20px;

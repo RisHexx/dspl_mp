@@ -3,6 +3,21 @@ import "./App.css";
 
 const API_URL = "http://localhost:8000";
 const CONFIDENCE_THRESHOLD = 0.82;
+const CAPTURE_INTERVAL_MS = 300;
+
+/* ── Box colours by sign family ──────────────────────────────────────── */
+const DANGER = new Set([11, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]);
+const PROHIBITORY = new Set([0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 14, 15, 16, 17]);
+const MANDATORY = new Set([33, 34, 35, 36, 37, 38, 39, 40]);
+const LOW_CONF_COLOR = "#94a3b8";
+
+function boxColor(classId) {
+  if (PROHIBITORY.has(classId)) return "#ef4444"; // red
+  if (DANGER.has(classId) || classId === 13) return "#f59e0b"; // amber
+  if (MANDATORY.has(classId)) return "#3b82f6"; // blue
+  if (classId === 12) return "#eab308"; // priority road – yellow
+  return "#a3a3a3"; // "end of …" signs – grey
+}
 
 /* ── Context-aware speech messages for each GTSRB class ──────────────── */
 const SPEECH_MESSAGES = {
@@ -53,19 +68,23 @@ const SPEECH_MESSAGES = {
 
 function App() {
   const videoRef = useRef(null);
-  const canvasRef = useRef(null);
+  const canvasRef = useRef(null); // hidden – used to grab frames
+  const overlayRef = useRef(null); // visible – bounding boxes drawn here
   const streamRef = useRef(null);
 
   const [cameraOn, setCameraOn] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState(null); // { sign_name, class_id, confidence }
-  const [snapshot, setSnapshot] = useState(null); // data URL
+  const [loading] = useState(false);
+  const [results, setResults] = useState([]); // confirmed detections
+  const [mode, setMode] = useState(null); // "detector" | "fallback"
   const [error, setError] = useState(null);
   const [latency, setLatency] = useState(0);
   const isProcessingRef = useRef(false);
 
   /* ── Consecutive-match confirmation ref ─────────────────────────────── */
-  const previousPredictionRef = useRef(null); // class_id from last frame
+  // class_ids seen (above threshold) in the previous frame. A sign is only
+  // "confirmed" once it shows up in two frames in a row – this stops the
+  // label from flickering on a single bad frame.
+  const previousClassesRef = useRef(new Set());
 
   /* ── TTS cooldown refs ─────────────────────────────────────────────── */
   const lastSpokenSignRef = useRef(null);
@@ -95,6 +114,58 @@ function App() {
     lastSpokenTimeRef.current = now;
   }, []);
 
+  /* ── Bounding-box overlay ────────────────────────────────────────────── */
+  // The overlay canvas uses the same pixel size as the video frame and the
+  // same CSS `object-fit: cover`, so box coordinates from the backend (which
+  // are in frame pixels) line up with the video without any manual scaling.
+  function clearOverlay() {
+    const overlay = overlayRef.current;
+    if (overlay) overlay.getContext("2d").clearRect(0, 0, overlay.width, overlay.height);
+  }
+
+  const drawDetections = useCallback((detections, imageSize, confirmed) => {
+    const overlay = overlayRef.current;
+    if (!overlay) return;
+    const [w, h] = imageSize;
+    if (overlay.width !== w) overlay.width = w;
+    if (overlay.height !== h) overlay.height = h;
+
+    const ctx = overlay.getContext("2d");
+    ctx.clearRect(0, 0, w, h);
+
+    const lineWidth = Math.max(2, Math.round(w / 220));
+    const fontSize = Math.max(12, Math.round(w / 40));
+    ctx.font = `600 ${fontSize}px Inter, system-ui, sans-serif`;
+    ctx.textBaseline = "top";
+
+    for (const det of detections) {
+      const [x1, y1, x2, y2] = det.box;
+      const sure = det.confidence >= CONFIDENCE_THRESHOLD;
+      const color = sure ? boxColor(det.class_id) : LOW_CONF_COLOR;
+      const label = sure
+        ? `${det.sign_name} · ${(det.confidence * 100).toFixed(0)}%`
+        : `? ${(det.confidence * 100).toFixed(0)}%`;
+
+      // Solid = confirmed over 2 frames, dashed = seen once / unsure
+      ctx.setLineDash(sure && confirmed.has(det.class_id) ? [] : [8, 6]);
+      ctx.lineWidth = lineWidth;
+      ctx.strokeStyle = color;
+      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+      // Label tag above the box (or inside if there's no room above)
+      ctx.setLineDash([]);
+      const pad = 4;
+      const tw = ctx.measureText(label).width + pad * 2;
+      const th = fontSize + pad * 2;
+      const ty = y1 - th >= 0 ? y1 - th : y1;
+      const tx = Math.min(x1, w - tw);
+      ctx.fillStyle = color;
+      ctx.fillRect(tx, ty, tw, th);
+      ctx.fillStyle = "#0b1120";
+      ctx.fillText(label, tx + pad, ty + pad);
+    }
+  }, []);
+
   /* ── Start / stop webcam ─────────────────────────────────────────────── */
   const startCamera = useCallback(async () => {
     try {
@@ -121,6 +192,9 @@ function App() {
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
+    clearOverlay();
+    previousClassesRef.current = new Set();
+    setResults([]);
     setCameraOn(false);
   }, []);
 
@@ -147,10 +221,6 @@ function App() {
 
     const ctx = canvas.getContext("2d");
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    // Save snapshot for display
-    const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
-    setSnapshot(dataUrl);
 
     // Convert canvas to Blob and send to backend
     const startTime = performance.now();
@@ -180,20 +250,36 @@ function App() {
           const data = await response.json();
           setLatency(Math.round(performance.now() - startTime));
 
-          // Only show result if confidence meets threshold AND
-          // the same sign was detected in the previous frame too
-          if (
-            data.confidence >= CONFIDENCE_THRESHOLD &&
-            previousPredictionRef.current === data.class_id
-          ) {
-            setResult(data);
-            speakAlert(data.class_id, data.sign_name);
-          } else if (data.confidence < CONFIDENCE_THRESHOLD) {
-            setResult(null);
+          setMode(data.mode);
+
+          const detections = data.detections || [];
+          const confident = detections.filter(
+            (d) => d.confidence >= CONFIDENCE_THRESHOLD
+          );
+          // Confirmed = confident now AND also seen in the previous frame
+          const confirmedIds = new Set(
+            confident
+              .filter((d) => previousClassesRef.current.has(d.class_id))
+              .map((d) => d.class_id)
+          );
+          previousClassesRef.current = new Set(confident.map((d) => d.class_id));
+
+          // Stop drawing if the camera was turned off while we were waiting
+          if (!streamRef.current) return;
+          drawDetections(detections, data.image_size, confirmedIds);
+
+          // One entry per class (highest confidence wins)
+          const seen = new Set();
+          const confirmed = confident.filter((d) => {
+            if (!confirmedIds.has(d.class_id) || seen.has(d.class_id)) return false;
+            seen.add(d.class_id);
+            return true;
+          });
+          setResults(confirmed);
+          if (confirmed.length > 0) {
+            // detections are sorted by confidence – announce the strongest
+            speakAlert(confirmed[0].class_id, confirmed[0].sign_name);
           }
-          // Store current prediction for next-frame comparison
-          previousPredictionRef.current =
-            data.confidence >= CONFIDENCE_THRESHOLD ? data.class_id : null;
         } catch (err) {
           console.error(err);
           setError(
@@ -206,17 +292,19 @@ function App() {
         }
       },
       "image/jpeg",
-      0.9
+      0.85
     );
-  }, []);
+  }, [drawDetections, speakAlert]);
 
   /* ── Auto-capture interval ───────────────────────────────────────────── */
+  // A new frame is only sent once the previous response has arrived
+  // (isProcessingRef), so this just sets the maximum frame rate.
   useEffect(() => {
     let intervalId;
     if (cameraOn) {
       intervalId = setInterval(() => {
         captureAndPredict();
-      }, 1000);
+      }, CAPTURE_INTERVAL_MS);
     }
     return () => {
       if (intervalId) clearInterval(intervalId);
@@ -290,6 +378,11 @@ function App() {
               style={{ display: cameraOn ? "block" : "none" }}
             />
             <canvas ref={canvasRef} />
+            <canvas
+              ref={overlayRef}
+              className="overlay-canvas"
+              style={{ display: cameraOn ? "block" : "none" }}
+            />
 
             {!cameraOn && (
               <div className="camera-placeholder">
@@ -343,30 +436,43 @@ function App() {
               </div>
             )}
 
-            {/* Result */}
-            {result && !loading && (
-              <div className="detected-sign">
-                <div className="sign-name">{result.sign_name}</div>
-
-                <div className="confidence-section">
-                  <div className="confidence-label">
-                    <span>Confidence</span>
-                    <span className="confidence-value">
-                      {(result.confidence * 100).toFixed(1)}%
-                    </span>
-                  </div>
-                  <div className="confidence-bar-bg">
-                    <div
-                      className={`confidence-bar-fill ${getConfidenceLevel(result.confidence)}`}
-                      style={{ width: `${result.confidence * 100}%` }}
-                    />
-                  </div>
+            {/* Results – one card per confirmed sign */}
+            {results.length > 0 && !loading && (
+              <div className="detections-list">
+                <div className="detections-meta">
+                  {results.length} sign{results.length > 1 ? "s" : ""} detected
+                  {latency > 0 && <> · {latency} ms</>}
+                  {mode === "fallback" && <> · no detector loaded</>}
                 </div>
+                {results.map((result) => (
+                  <div
+                    className="detected-sign"
+                    key={result.class_id}
+                    style={{ borderLeft: `4px solid ${boxColor(result.class_id)}` }}
+                  >
+                    <div className="sign-name">{result.sign_name}</div>
+
+                    <div className="confidence-section">
+                      <div className="confidence-label">
+                        <span>Confidence</span>
+                        <span className="confidence-value">
+                          {(result.confidence * 100).toFixed(1)}%
+                        </span>
+                      </div>
+                      <div className="confidence-bar-bg">
+                        <div
+                          className={`confidence-bar-fill ${getConfidenceLevel(result.confidence)}`}
+                          style={{ width: `${result.confidence * 100}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
 
             {/* Empty state */}
-            {!result && !loading && !error && (
+            {results.length === 0 && !loading && !error && (
               <div className="result-empty">
                 <div className="icon">🎯</div>
                 <p>
